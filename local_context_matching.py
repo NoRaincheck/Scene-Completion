@@ -500,6 +500,13 @@ def inpaint_seams_lama(stages: Dict[str, object], local_context_size: int = 55,
     h, w = output.shape[:2]
 
     band_scene = build_seam_band_mask(stages["mask_seam"], band)
+
+    # the hole rim is always a material boundary (pasted match content
+    # against the original photograph); ring it too so cleanup still
+    # happens when the seam cut degenerated into a solid mask_seam
+    replaced_hole = (stages["mask_scene"] == 0).astype(np.uint8) * 255
+    band_scene = cv2.bitwise_or(band_scene,
+                                build_seam_band_mask(replaced_hole, band))
     min_x, max_x, min_y, max_y = _context_bbox(stages["mask"],
                                                local_context_size)
 

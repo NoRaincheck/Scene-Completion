@@ -18,7 +18,7 @@ Given a photograph and a mask (black = region to remove), the pipeline:
 
 For each sample: the input photograph, its mask (white = keep, black = region to fill),
 the best-scoring candidate photo (ranked automatically by masked context SSD), and the
-completed output.
+completed output after the LaMa seam cleanup pass.
 
 | Input | Mask | Best match | Completed output |
 | --- | --- | --- | --- |
@@ -35,6 +35,11 @@ enclosed region is replaced:
 | Seam mask (white = replaced) | Pasted composite | Final seamless-clone result |
 | --- | --- | --- |
 | ![seam](sample_images/results/input3_mask_seam.jpg) | ![pasted](sample_images/results/input3_seam.jpg) | ![output](sample_images/results/input3_output.jpg) |
+
+Finally, the LaMa pass re-synthesises the paste boundaries — shown below as
+raw composite → seam band handed to the network → cleaned output:
+
+![LaMa seam cleanup](sample_images/results/input3_lama_cleanup.jpg)
 
 ## Getting started
 
