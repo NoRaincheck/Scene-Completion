@@ -66,7 +66,7 @@ def read_images(orig_name: str, mask_name: str, match_name: str):
     arguments:
 
     orig_name : path of the original image
-    mask_name : path of the mask (white = keep, black = hole to fill)
+    mask_name : path of the mask (white = region to fill)
     match_name : path of the candidate image to source pixels from
 
     returns:
@@ -80,6 +80,9 @@ def read_images(orig_name: str, mask_name: str, match_name: str):
     mask = cv2.imread(mask_name, cv2.IMREAD_GRAYSCALE)
     # force the mask to be black and white
     _, mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    # masks use the inpainting convention (white = region to fill); invert
+    # so that internally the pipeline keeps treating black pixels as the hole
+    mask = 255 - mask
     match = cv2.imread(match_name)
 
     if orig is None or mask is None or match is None:
@@ -699,7 +702,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="Scene completion via local context matching.")
     parser.add_argument("--image", required=True, help="original photograph")
     parser.add_argument("--mask", required=True,
-                        help="mask image, black = region to fill")
+                        help="mask image, white = region to fill")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--match", help="candidate image to source pixels from")
     group.add_argument("--candidates-dir",

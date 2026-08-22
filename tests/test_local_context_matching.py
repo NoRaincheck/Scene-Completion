@@ -4,6 +4,7 @@ Run with: uv run pytest
 """
 
 import os
+import tempfile
 
 import cv2
 import numpy as np
@@ -83,6 +84,26 @@ def test_ssd_ignores_black_pixels_of_imageB():
     b[0, 0] = 100
     # only pixel (0,0) is compared -> zero difference
     assert lcm.ssd(a, b) == 0.0
+
+
+def test_read_images_inverts_white_fill_masks():
+    """Mask files use the inpainting convention (white = fill); after
+    loading, the pipeline's internal convention must hold: black = hole."""
+    mask_img = np.zeros((40, 40), np.uint8)
+    mask_img[10:30, 10:30] = 255                    # white marks the fill region
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mask.png")
+        assert cv2.imwrite(path, mask_img)
+        orig = np.zeros((40, 40, 3), np.uint8)
+        cv2.imwrite(os.path.join(tmp, "orig.png"), orig)
+        cv2.imwrite(os.path.join(tmp, "match.png"), orig)
+
+        _, mask, _ = lcm.read_images(os.path.join(tmp, "orig.png"),
+                                     path, os.path.join(tmp, "match.png"))
+
+    hole = mask == 0                                # internally black = hole
+    assert hole.sum() == 20 * 20
+    assert hole[10:30, 10:30].all()
 
 
 def test_get_masked_scene_crops_and_blacks_out_hole():

@@ -6,7 +6,7 @@ A naive Python implementation of Local Context Matching as shown in
 Photography Course. More information on the approach can be found
 [here](https://docs.google.com/presentation/d/1ObIpms39d0bY6UPnAt8woTY66nbgHukCCf_94OQjhtQ/pub?start=false&loop=false&delayms=3000).
 
-Given a photograph and a mask (black = region to remove), the pipeline:
+Given a photograph and a mask (white = region to remove), the pipeline:
 
 1. crops a **local context** window around the hole,
 2. finds the best matching window inside a candidate photograph with a **masked SSD** search,
@@ -16,7 +16,7 @@ Given a photograph and a mask (black = region to remove), the pipeline:
 
 ## Example results
 
-For each sample: the input photograph, its mask (white = keep, black = region to fill),
+For each sample: the input photograph, its mask (white = region to fill),
 the best-scoring candidate photo (ranked automatically by masked context SSD), and the
 completed output after the LaMa seam cleanup pass.
 
