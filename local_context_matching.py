@@ -462,51 +462,84 @@ def composite(orig: np.ndarray, com_scene: np.ndarray, mask: np.ndarray,
 # lama seam cleanup
 # ---------------------------------------------------------------------------
 
-def build_seam_band_mask(mask_seam: np.ndarray, band: int = 12) -> np.ndarray:
-    """Ring mask straddling the boundary of the replaced region.
+def build_seam_band_mask(mask_seam: np.ndarray, band: int = 12,
+                         solid: bool = False) -> np.ndarray:
+    """Mask of the region handed to LaMa for re-synthesis.
 
     ``mask_seam`` marks where match content was pasted over the original
-    (255 = replaced).  The visible paste seams live exactly on that
-    boundary, so we cover a band of ``band`` pixels outside it and about
-    half that inside it: enough for LaMa to re-synthesise the transition
-    without repainting the whole fill.
+    (255 = replaced).
+
+    solid=False (ring): a band of ``band`` pixels straddling that boundary
+    (about half inside) -- LaMa only harmonises the paste transition.
+
+    solid=True: the entire replaced region, grown outward by ``band``
+    pixels -- a single filled mask so LaMa re-synthesises the whole fill.
     """
     m = mask_seam if mask_seam.ndim == 2 else cv2.cvtColor(
         mask_seam.astype(np.uint8), cv2.COLOR_BGR2GRAY)
     m = ((m > 0) * 255).astype(np.uint8)
 
     k_out = 2 * band + 1                      # dilate radius ~ band
-    k_in = max(3, band | 1)                   # erode radius ~ band / 2
     outer = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                     (k_out, k_out)))
+    if solid:
+        return (outer > 0).astype(np.uint8) * 255
+
+    k_in = max(3, band | 1)                   # erode radius ~ band / 2
     inner = cv2.erode(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                    (k_in, k_in)))
     return ((outer > 0) & (inner == 0)).astype(np.uint8) * 255
 
 
+def _adaptive_band_width(mask_scene: np.ndarray, min_band: int = 12,
+                         scale: float = 0.25,
+                         max_band: int = 64) -> int:
+    """LaMa region margin grown with the size of the hole.
+
+    ``max(min_band, min(max_band, scale * hole bbox larger side))`` so
+    small holes keep the minimum width, mid-size holes grow proportionally
+    and pathologically large holes do not repaint the whole photograph.
+    """
+    hole = mask_scene == 0
+    if not hole.any():
+        return int(min_band)
+    ys, xs = np.where(hole)
+    size = max(int(ys.max()) - int(ys.min()), int(xs.max()) - int(xs.min())) + 1
+    return int(np.clip(round(scale * size), int(min_band), int(max_band)))
+
+
 def inpaint_seams_lama(stages: Dict[str, object], local_context_size: int = 55,
-                       band: int = 12) -> Tuple[np.ndarray, np.ndarray]:
+                       band: int = 12, solid: bool = True,
+                       band_scale: float = 0.25) -> Tuple[np.ndarray, np.ndarray]:
     """Clean up the composited output by inpainting its seams with LaMa.
 
-    A seam band mask is derived from the pipeline's seam cut, lifted back
-    to full resolution coordinates and handed to LaMa; the result is
-    feather-blended into the output so pixels away from the seams stay
-    exactly as they were.
+    The region handed to LaMa is derived from the pipeline's seam cut,
+    lifted back to full resolution coordinates; the result is feather-
+    blended into the output so pixels outside it stay exactly as they
+    were.  By default the region is the whole replaced area grown by an
+    adaptive margin (``band`` clamped between the minimum and
+    ``band_scale * hole size``, capped); with ``solid=False`` only a ring
+    around the paste boundary is repainted.
 
     returns:
-    (cleaned output, full resolution seam band mask)
+    (cleaned output, full resolution lama mask)
     """
     output = np.clip(stages["output"], 0, 255).astype(np.uint8)
     h, w = output.shape[:2]
 
-    band_scene = build_seam_band_mask(stages["mask_seam"], band)
+    # grow the width of the region with the size of the hole
+    band = _adaptive_band_width(stages["mask_scene"], band, band_scale)
 
-    # the hole rim is always a material boundary (pasted match content
-    # against the original photograph); ring it too so cleanup still
-    # happens when the seam cut degenerated into a solid mask_seam
-    replaced_hole = (stages["mask_scene"] == 0).astype(np.uint8) * 255
-    band_scene = cv2.bitwise_or(band_scene,
-                                build_seam_band_mask(replaced_hole, band))
+    # replaced content: seam-cut region plus the hole itself (the rim is
+    # always a material boundary, and this keeps the mask meaningful even
+    # when the seam cut degenerated into a solid mask_seam)
+    seam = stages["mask_seam"]
+    if seam.ndim == 3:
+        seam = cv2.cvtColor(seam.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    replaced = ((seam > 0) |
+                (stages["mask_scene"] == 0)).astype(np.uint8) * 255
+    band_scene = build_seam_band_mask(replaced, band, solid=solid)
+
     min_x, max_x, min_y, max_y = _context_bbox(stages["mask"],
                                                local_context_size)
 
@@ -519,19 +552,26 @@ def inpaint_seams_lama(stages: Dict[str, object], local_context_size: int = 55,
         band_scene[:rows, :cols]
 
     if not (band_full > 0).any():
-        print("  LaMa: empty seam band, skipping inpainting")
+        print("  LaMa: empty lama mask, skipping inpainting")
         return output, band_full
 
-    print(f"  LaMa: inpainting seam band "
-          f"({int((band_full > 0).sum())} px)")
+    print(f"  LaMa: inpainting {'solid region' if solid else 'seam band'} "
+          f"({int((band_full > 0).sum())} px, margin {band} px)")
     cleaned = lama_inpaint.lama_inpaint(output, band_full)
     if cleaned is None:
         return output, band_full
 
-    # feathered blend: untouched pixels stay bit-exact, only the band is
-    # replaced by the inpainted content
-    kernel = 2 * band + 1
-    alpha = cv2.GaussianBlur(band_full, (kernel, kernel), 0)[..., None] / 255.0
+    # feathered blend: untouched pixels stay bit-exact, only the masked
+    # region is replaced by the inpainted content.  The transition is kept
+    # strictly inside the grown margin: blur an eroded copy so alpha fades
+    # out before reaching the mask edge, and clamp it to zero elsewhere.
+    feather = 2 * min(max(3, band // 2), 32) + 1
+    inner = cv2.erode(band_full, cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (feather, feather)))
+    if not (inner > 0).any():
+        inner = band_full
+    alpha = cv2.GaussianBlur(inner, (feather, feather), 0)[..., None] / 255.0
+    alpha = np.where(band_full[..., None] > 0, alpha, 0.0)
     blended = output.astype(np.float64) * (1 - alpha) + \
         cleaned.astype(np.float64) * alpha
     return np.clip(blended, 0, 255).astype(np.uint8), band_full
@@ -545,12 +585,16 @@ def scene_completion_pipeline(orig_name: str, mask_name: str, match_name: str,
                               local_context_size: int = 55,
                               dilation: bool = True,
                               lama: bool = True,
-                              lama_band: int = 12) -> Dict[str, object]:
+                              lama_band: int = 12,
+                              lama_solid: bool = True,
+                              lama_band_scale: float = 0.25) -> Dict[str, object]:
     """Run the full pipeline and return every intermediate stage.
 
     When ``lama`` is true the composited output gets a final pass in which
-    the paste seams are re-synthesised with LaMa inpainting (``lama_band``
-    controls the width of the re-inpainted band around each seam).
+    the pasted region is re-synthesised with LaMa inpainting.  The region
+    is grown by ``max(lama_band, lama_band_scale * hole size)`` pixels;
+    with ``lama_solid`` it is a filled region covering the whole fill,
+    otherwise just a ring around the paste boundary.
     """
     orig, mask, match = read_images(orig_name, mask_name, match_name)
     orig_scene, mask_scene, orig_scene_no_mask, dialation_mask = get_masked_scene(
@@ -588,7 +632,8 @@ def scene_completion_pipeline(orig_name: str, mask_name: str, match_name: str,
 
     if lama:
         output_lama, seam_band_mask = inpaint_seams_lama(
-            stages, local_context_size, lama_band)
+            stages, local_context_size, lama_band,
+            solid=lama_solid, band_scale=lama_band_scale)
         stages["seam_band_mask"] = seam_band_mask
         stages["output_lama"] = output_lama
 
@@ -600,7 +645,9 @@ def local_context_match(orig_name: str, mask_name: str, match_name: str,
                         method: str = 'seamlessclone',
                         dilation: bool = True,
                         lama: bool = True,
-                        lama_band: int = 12) -> np.ndarray:
+                        lama_band: int = 12,
+                        lama_solid: bool = True,
+                        lama_band_scale: float = 0.25) -> np.ndarray:
     """Complete the ``mask_name`` region of ``orig_name`` using ``match_name``.
 
     Sample usage::
@@ -609,7 +656,9 @@ def local_context_match(orig_name: str, mask_name: str, match_name: str,
     """
     stages = scene_completion_pipeline(orig_name, mask_name, match_name,
                                        local_context_size, dilation,
-                                       lama=lama, lama_band=lama_band)
+                                       lama=lama, lama_band=lama_band,
+                                       lama_solid=lama_solid,
+                                       lama_band_scale=lama_band_scale)
     return stages.get("output_lama", stages["output"])
 
 
@@ -657,7 +706,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-lama", action="store_true",
                         help="skip the final LaMa seam inpainting pass")
     parser.add_argument("--lama-band", type=int, default=12,
-                        help="width in pixels of the LaMa seam band (default 12)")
+                        help="minimum width in pixels of the LaMa region margin "
+                             "(default 12)")
+    parser.add_argument("--lama-band-scale", type=float, default=0.25,
+                        help="margin growth per pixel of hole size; the margin is "
+                             "max(--lama-band, scale * hole side) (default 0.25)")
+    parser.add_argument("--lama-ring", action="store_true",
+                        help="only repaint a ring around the paste boundary "
+                             "instead of the whole filled region")
     parser.add_argument("--save-dir", default="output",
                         help="where to write the result and diagnostics")
     parser.add_argument("--quiet", action="store_true",
@@ -687,7 +743,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     stages = scene_completion_pipeline(args.image, args.mask, match_name,
                                        args.context_size,
                                        lama=not args.no_lama,
-                                       lama_band=args.lama_band)
+                                       lama_band=args.lama_band,
+                                       lama_solid=not args.lama_ring,
+                                       lama_band_scale=args.lama_band_scale)
     save_stages(stages, args.save_dir)
     print(f"wrote {os.path.join(args.save_dir, 'output.jpg')}")
     if "output_lama" in stages:

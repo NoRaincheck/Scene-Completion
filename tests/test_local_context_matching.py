@@ -124,7 +124,7 @@ def test_create_seam_cut_masks_entire_hole():
 
 
 def test_build_seam_band_mask_is_a_boundary_ring():
-    """The band must hug the replaced-region boundary on both sides."""
+    """Ring mode must hug the replaced-region boundary on both sides."""
     replaced = np.zeros((100, 100), np.uint8)
     replaced[30:70, 35:65] = 255
 
@@ -140,6 +140,38 @@ def test_build_seam_band_mask_is_a_boundary_ring():
     assert g[31, 50] == 255      # just inside (match side)
     # ring must be thin relative to the region it surrounds
     assert (g > 0).sum() < 0.25 * g.size
+
+
+def test_build_seam_band_mask_solid_fills_region():
+    """Solid mode must cover the whole replaced region plus its margin."""
+    replaced = np.zeros((100, 100), np.uint8)
+    replaced[30:70, 35:65] = 255
+
+    solid = lcm.build_seam_band_mask(replaced, band=6, solid=True)
+
+    assert solid.shape == (100, 100)
+    assert (solid[30:70, 35:65] == 255).all()   # interior fully covered
+    assert solid[29, 50] == 255                 # margin grown outside
+    assert solid[71, 50] == 255
+    assert solid[22, 50] == 0                   # beyond ~band: untouched
+    assert solid[2, 2] == 0
+
+
+def test_adaptive_band_width_grows_with_hole_size():
+    small = np.full((200, 200), 255, np.uint8)
+    small[90:110, 90:110] = 0                       # 20 px hole
+    assert lcm._adaptive_band_width(small, min_band=12,
+                                    scale=0.25) == 12   # clamped to minimum
+
+    big = np.full((400, 400), 255, np.uint8)
+    big[100:300, 150:250] = 0                       # 200 px hole
+    assert lcm._adaptive_band_width(big, min_band=12,
+                                    scale=0.25) == 50   # 0.25 * 200
+
+    huge = np.full((1000, 1000), 255, np.uint8)
+    huge[100:900, 100:900] = 0                      # 800 px hole
+    assert lcm._adaptive_band_width(huge, min_band=12,
+                                    scale=0.25) == 64   # clamped to maximum
 
 
 # ---------------------------------------------------------------------------
