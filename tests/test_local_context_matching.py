@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import local_context_matching as lcm
+import lama_inpaint
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMG3 = os.path.join(REPO, "sample_images", "images", "input3.jpg")
@@ -122,6 +123,25 @@ def test_create_seam_cut_masks_entire_hole():
     assert coverage > 0.99, f"seam covers only {coverage:.1%} of the hole"
 
 
+def test_build_seam_band_mask_is_a_boundary_ring():
+    """The band must hug the replaced-region boundary on both sides."""
+    replaced = np.zeros((100, 100), np.uint8)
+    replaced[30:70, 35:65] = 255
+
+    band = lcm.build_seam_band_mask(lcm.np2to3(replaced), band=6)
+    g = band
+
+    assert g.shape == (100, 100)
+    assert g.dtype == np.uint8
+    assert g[50, 50] == 0        # deep inside the replaced region: untouched
+    assert g[2, 2] == 0          # far outside: untouched
+    assert g[29, 50] == 255      # just outside the boundary (original side)
+    assert g[71, 50] == 255      # just outside on the other side
+    assert g[31, 50] == 255      # just inside (match side)
+    # ring must be thin relative to the region it surrounds
+    assert (g > 0).sum() < 0.25 * g.size
+
+
 # ---------------------------------------------------------------------------
 # integration tests on the bundled samples
 # ---------------------------------------------------------------------------
@@ -141,3 +161,29 @@ def test_full_pipeline_on_sample_image():
     assert np.abs(out[hole].astype(float) - orig[hole].astype(float)).mean() > 1
     # the kept context must be almost untouched
     assert np.abs(out[keep].astype(float) - orig[keep].astype(float)).mean() < 20
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not lama_inpaint.DEFAULT_MODEL_PATH.exists(),
+                    reason="models/lama.onnx not present")
+def test_lama_seam_cleanup_only_touches_the_band():
+    """LaMa cleanup must alter pixels near seams and leave the rest exact."""
+    stages = lcm.scene_completion_pipeline(IMG3, MASK3,
+                                           os.path.join(REPO, "sample_images",
+                                                        "images", "input3",
+                                                        "result_img001.jpg"))
+    out, cleaned = stages["output"], stages["output_lama"]
+    band = stages["seam_band_mask"]
+
+    assert cleaned.shape == out.shape and cleaned.dtype == np.uint8
+    assert band.shape == out.shape[:2]
+    assert (band > 0).any()
+
+    # pixels well away from any seam must be bit-identical
+    far = cv2.erode((band == 0).astype(np.uint8),
+                    np.ones((31, 31), np.uint8)) > 0
+    assert far.any()
+    assert np.array_equal(out[far], cleaned[far])
+
+    # ...and something near the seams must actually have been re-synthesised
+    assert (out != cleaned).any()

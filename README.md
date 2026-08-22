@@ -11,7 +11,8 @@ Given a photograph and a mask (black = region to remove), the pipeline:
 1. crops a **local context** window around the hole,
 2. finds the best matching window inside a candidate photograph with a **masked SSD** search,
 3. cuts around the hole along minimal difference **seams** (Dijkstra / graph cut),
-4. blends the match into the original with OpenCV **seamless cloning**.
+4. blends the match into the original with OpenCV **seamless cloning**,
+5. re-synthesises the paste seams with **LaMa inpainting** so the final image shows no transition artefacts.
 
 ## Example results
 
@@ -68,7 +69,30 @@ uv run python local_context_matching.py \
 ```
 
 Every intermediate stage (context windows, best match, seam mask, composites,
-final output) is written to `--save-dir`.
+final output) is written to `--save-dir`. The last stage written,
+`output_lama.jpg`, is the final output after the LaMa seam cleanup pass.
+Pass `--no-lama` to skip it and keep the raw composite (`output.jpg`), or
+`--lama-band N` to widen/narrow the band of pixels re-inpainted around each
+seam (default 12).
+
+### LaMa seam inpainting
+
+The composited result inevitably shows a visible transition where the matched
+content is pasted over the original photo. [`lama_inpaint.py`](lama_inpaint.py)
+removes these artefacts with [LaMa](https://github.com/advimman/lama) running
+through OpenCV's DNN module:
+
+1. a ring-shaped band mask is derived from the graph-cut seam (a few pixels on
+   each side of every paste boundary),
+2. a padded window around the band is resampled to the network's fixed 512x512
+   input, inpainted in one pass, and resampled back at full resolution — much
+   sharper than squashing the whole photograph to 512x512,
+3. the result is feather-blended under the band mask, so pixels away from the
+   seams remain bit-identical to the raw composite.
+
+The weights live in [`models/lama.onnx`](models/lama.onnx) and are tracked with
+[Git LFS](https://git-lfs.com/) — install it before cloning, otherwise you will
+only fetch a pointer file instead of the ~90 MB model.
 
 ### Tests
 
@@ -104,7 +128,13 @@ uv run jupyter lab
 | `create_seam_cut` | four minimum-cost seams around the hole via `skimage.graph.MCP`, closed by flood fill |
 | `composite_scene` | merge match into original via `paste`, feathered `alphablend`, or Poisson `seamlessclone` |
 | `composite` | paste the completed context back into the full size image |
+| `build_seam_band_mask` | ring mask straddling the boundary of the pasted (match) region |
+| `inpaint_seams_lama` | re-synthesise the paste seams with LaMa and feather-blend them back |
 | `local_context_match` / `scene_completion_pipeline` | run everything end to end |
+
+`lama_inpaint.py` wraps the ONNX model itself: lazy single load of the network,
+windowed 512x512 inference at arbitrary resolutions (`lama_inpaint`), plus a
+standalone CLI (`uv run python lama_inpaint.py [image] [mask]`).
 
 ## Other notes and work
 
