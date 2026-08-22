@@ -32,7 +32,7 @@ completed output after the LaMa seam cleanup pass.
 Between matching and blending, a graph-cut seam is traced around the hole and the
 enclosed region is replaced:
 
-| Seam mask (white = replaced) | Pasted composite | Final seamless-clone result |
+| Seam mask (white = replaced) | Pasted composite | Final output (after LaMa cleanup) |
 | --- | --- | --- |
 | ![seam](sample_images/results/input3_mask_seam.jpg) | ![pasted](sample_images/results/input3_seam.jpg) | ![output](sample_images/results/input3_output.jpg) |
 
@@ -115,12 +115,8 @@ uv run pytest -m slow      # + full pipeline integration test
 uv run jupyter lab
 ```
 
-* [`local_context_matching.ipynb`](local_context_matching.ipynb) — step by step
-  walkthrough of the full scene completion pipeline on `input3`.
-* [`GistDescriptor/gist_descriptor.ipynb`](GistDescriptor/gist_descriptor.ipynb) —
-  grayscale GIST descriptor from Gabor filter banks.
 * [`GistDescriptor/gist_descriptor_colour.ipynb`](GistDescriptor/gist_descriptor_colour.ipynb) —
-  colour variant: the descriptor is computed per BGR channel and concatenated
+  colour GIST descriptor: computed per BGR channel and concatenated
   (16 x 32 x 3 = 1536 values).
 
 ## How it works
