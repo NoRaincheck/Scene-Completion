@@ -1,0 +1,16 @@
+# uv / python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# jupyter
+.ipynb_checkpoints/
+
+# pipeline output
+output/
+
+# os junk
+.DS_Store

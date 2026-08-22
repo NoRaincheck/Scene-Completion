@@ -1,607 +1,588 @@
+"""Local Context Matching for scene completion.
 
-# coding: utf-8
+A naive Python implementation of Local Context Matching as shown in
+"Scene Completion Using Millions of Photographs"
+(http://graphics.cs.cmu.edu/projects/scene-completion/).
 
-# In[34]:
+Given an input photograph and a mask marking a region to remove, the
+algorithm:
+  1. crops a "local context" window around the masked hole,
+  2. finds the best matching window inside a candidate photograph using
+     a masked SSD search,
+  3. cuts around the hole along minimal difference seams (graph cut),
+  4. blends the match into the original with OpenCV seamless cloning.
 
-# we will create functions for the scene completion algorithm
+Example:
+    uv run python local_context_matching.py \
+        --image sample_images/images/input3.jpg \
+        --mask sample_images/images/input3_mask.jpg \
+        --candidates-dir sample_images/images/input3 \
+        --save-dir output
+"""
 
+from __future__ import annotations
 
-# In[35]:
+import argparse
+import glob
+import os
+import random
+from typing import Dict, List, Optional, Sequence, Tuple
 
-get_ipython().magic(u'matplotlib inline')
 import cv2
-from matplotlib import pyplot as plt
-
-import skimage.graph
 import numpy as np
-
-from random import choice # for getting the seams randomly
-# the best seam has not been chosen for this assignment.
-
-
-# In[36]:
-
-#### helper function for ipython
-
-def implot(im, gray=False):
-    cv_rgb = cv2.cvtColor(im.astype(np.uint8), cv2.COLOR_BGR2RGB)
-    plt.imshow(cv_rgb)
-    #plt.show()
-    
-def np2to3(im):
-    # convert 2d to 3d naively
-    new_im = np.zeros((im.shape[0], im.shape[1], 3))
-    r, c = im.shape
-    for x in range(r):
-        for y in range(c):
-            new_im[x, y, :] = im[x,y]
-    return new_im
+import matplotlib.pyplot as plt
+import skimage.graph
 
 
-# In[37]:
+# ---------------------------------------------------------------------------
+# ipython / plotting helpers
+# ---------------------------------------------------------------------------
 
-def read_images(orig_name, mask_name, match_name):
-    """reads the three file names for the images and returns
-    the three images for future processing 
-    
+def implot(im: np.ndarray, gray: bool = False) -> None:
+    """Plot an OpenCV (BGR) image with matplotlib."""
+    if gray or im.ndim == 2:
+        plt.imshow(im.astype(np.uint8), cmap="gray")
+    else:
+        cv_rgb = cv2.cvtColor(im.astype(np.uint8), cv2.COLOR_BGR2RGB)
+        plt.imshow(cv_rgb)
+    plt.axis("off")
+
+
+def np2to3(im: np.ndarray) -> np.ndarray:
+    """Convert a 2D (grayscale) image to a 3 channel image."""
+    return np.dstack([im, im, im])
+
+
+# ---------------------------------------------------------------------------
+# loading
+# ---------------------------------------------------------------------------
+
+def read_images(orig_name: str, mask_name: str, match_name: str):
+    """Read the three file names and return the images for processing.
+
     arguments:
-    
-    orig_name
-    mask_name
-    match_name
-    
+
+    orig_name : path of the original image
+    mask_name : path of the mask (white = keep, black = hole to fill)
+    match_name : path of the candidate image to source pixels from
+
     returns:
-    orig image
-    mask image
-    match image    
+    orig, mask, match
     """
+    for name in (orig_name, mask_name, match_name):
+        if not os.path.isfile(name):
+            raise FileNotFoundError(f"could not find image: {name}")
+
     orig = cv2.imread(orig_name)
-    mask = cv2.imread(mask_name, cv2.IMREAD_GRAYSCALE) 
-    (thresh, mask) = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU) # force it to be black and white
+    mask = cv2.imread(mask_name, cv2.IMREAD_GRAYSCALE)
+    # force the mask to be black and white
+    _, mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     match = cv2.imread(match_name)
-    
+
+    if orig is None or mask is None or match is None:
+        raise IOError(f"failed to decode one of {orig_name}, {mask_name}, {match_name}")
     return orig, mask, match
 
 
-# In[38]:
+# ---------------------------------------------------------------------------
+# local context extraction
+# ---------------------------------------------------------------------------
 
-def get_masked_scene(orig, mask, local_context_size = 80, dilation=False):
-    """Takes in the original and mask images, 
-    returns the scenes based on the "local_context_size".
-    
+def get_masked_scene(orig: np.ndarray, mask: np.ndarray,
+                     local_context_size: int = 80, dilation: bool = False):
+    """Crop the scene around the mask ("local context" window).
+
     arguments:
-    
+
     orig : original image
-    mask : the mask which is on the original image
-           
+    mask : the mask which is on the original image (0 = hole)
+    local_context_size : margin in pixels added around the hole
+    dilation : additionally zero out a dilated band around the hole
+
     returns:
-    
-    masked_scene : returns the scene on the original image with 
-                   the mask "centered"
+
+    orig_scene : the cropped scene with the hole blacked out
+    mask_scene : the cropped mask
+    orig_scene_no_mask : the cropped scene with only the hole blacked out
+                         (context intact)
+    dialation_mask : 255 where context is trusted (used downstream)
     """
     orig_scene = orig.copy()
     mask_scene = mask.copy()
     orig_scene_no_mask = orig.copy()
-    
-    mask_info = np.where(mask_scene == 0)    
-    min_x = max(min(mask_info[0]) - local_context_size, 0)
-    max_x = max(mask_info[0]) + local_context_size
-    min_y = max(min(mask_info[1]) - local_context_size, 0)
-    max_y = max(mask_info[1]) + local_context_size
-    
-    orig_scene = orig_scene[min_x:max_x,min_y:max_y]
-    orig_scene_no_mask = orig_scene_no_mask[min_x:max_x,min_y:max_y]
-    mask_scene = mask_scene[min_x:max_x,min_y:max_y]
-    
-    dialation_mask = np.zeros(mask_scene.shape) + 255
-    
+
+    mask_info = np.where(mask_scene == 0)
+    if len(mask_info[0]) == 0:
+        raise ValueError("the mask contains no black (masked-out) pixels")
+
+    min_x = max(int(mask_info[0].min()) - local_context_size, 0)
+    max_x = int(mask_info[0].max()) + local_context_size
+    min_y = max(int(mask_info[1].min()) - local_context_size, 0)
+    max_y = int(mask_info[1].max()) + local_context_size
+
+    orig_scene = orig_scene[min_x:max_x, min_y:max_y]
+    orig_scene_no_mask = orig_scene_no_mask[min_x:max_x, min_y:max_y]
+    mask_scene = mask_scene[min_x:max_x, min_y:max_y]
+
+    dialation_mask = (np.zeros(mask_scene.shape) + 255).astype(np.uint8)
+
     if dilation:
-        dialation_mask = cv2.dilate(255-mask_scene, np.ones((local_context_size,local_context_size)))
-        
-    #implot(dialation_mask)
-    #plt.imshow(dialation_mask, 'gray')
-    
-    for x in range(mask_scene.shape[0]):
-        for y in range(mask_scene.shape[1]):
-            if mask_scene[x, y] == 0:
-                orig_scene[x, y, :] = 0
-                orig_scene_no_mask[x,y,:] = 0
-            if dilation:
-                if dialation_mask[x,y] == 0:
-                    orig_scene[x, y, :] = 0
-                
+        kernel = np.ones((local_context_size, local_context_size), np.uint8)
+        dialation_mask = cv2.dilate(255 - mask_scene, kernel)
+
+    # black out the hole in both scene variants (vectorised)
+    hole = mask_scene == 0
+    orig_scene[hole] = 0
+    orig_scene_no_mask[hole] = 0
+    if dilation:
+        orig_scene[dialation_mask == 0] = 0
+
     return orig_scene, mask_scene, orig_scene_no_mask, dialation_mask
 
 
+def ssd(imageA: np.ndarray, imageB: np.ndarray, mask=None) -> Optional[float]:
+    """Sum of squared differences between two images.
 
-def ssd(imageA, imageB, mask=0):
-    """
-    purple
+    Only pixels where ``imageB > 0`` are compared when no explicit mask
+    is given (this matches the behaviour of the original implementation).
     """
     try:
-        ssd = np.sum(np.square(imageA[imageB > 0].astype("float") - imageB[imageB > 0].astype("float")))        
-        return ssd
-    except:
+        if mask is None:
+            valid = imageB > 0
+        else:
+            valid = mask > 0
+        diff = imageA[valid].astype("float") - imageB[valid].astype("float")
+        return float(np.sum(np.square(diff)))
+    except ValueError:
         return None
 
 
-# In[39]:
+# ---------------------------------------------------------------------------
+# best match search
+# ---------------------------------------------------------------------------
 
-def find_scene(orig_scene, match):
-    """given the original scene provided by `get_masked_scene`
-    try to find the best match, by brute force with mse as
-    a measure of 'error in alignment' 
-    
-    returns:
-    
-    best_x : x coordinates of best matching scene
-    best_y : y coordinates of best matching scene
-    match_scene : the best scene which was returned
+def _context_mask(scene: np.ndarray) -> np.ndarray:
+    """Binary float mask of the valid (non hole) context pixels."""
+    return (cv2.cvtColor(scene.astype(np.uint8), cv2.COLOR_BGR2GRAY) > 0).astype(np.float32)
+
+
+def find_scene_bruteforce(orig_scene: np.ndarray, match: np.ndarray):
+    """Reference brute force masked-SSD search (slow, kept for tests).
+
+    Returns (best_x, best_y, best_sample) where best_x/best_y are the
+    row/column offsets of the best matching window inside ``match``.
     """
-    
-    image_to_compare = orig_scene.copy()
-    
-    r,c,_ = match.shape
-    ir, ic, _ = image_to_compare.shape
+    ir, ic, _ = orig_scene.shape
+    r, c, _ = match.shape
+    if ir > r or ic > c:
+        raise ValueError("match image is smaller than the local context window")
+
     min_ssd = None
-
-
-    for x in range(r):
-        for y in range(c):
-            # compare to sample image to start off with...
-            # mse(imageA, imageB, mask=0)       
-
-#            if x % 25 == 0 and y == 50:
-#                print x
-
-            # assume x,y is top left corner, 
-            imageA = match[x:x+ir, y:y+ic, :]
-
-            if imageA.shape[0] != ir or imageA.shape[1] != ic:
+    best_sample = None
+    best_x = best_y = None
+    for x in range(r - ir + 1):          # row offset
+        for y in range(c - ic + 1):      # column offset
+            imageA = match[x:x + ir, y:y + ic]
+            current_ssd = ssd(imageA, orig_scene)
+            if current_ssd is None:
                 continue
-
-            # add the mask     
-
-            current_ssd = ssd(imageA, image_to_compare)
-            if current_ssd == None:
-                pass
-            elif min_ssd == None:
+            if min_ssd is None or min_ssd > current_ssd:
                 min_ssd = current_ssd
-                best_sample = imageA
-                best_x = x
-                best_y = y
-            elif min_ssd > current_ssd:
-                min_ssd = current_ssd
-                best_sample = imageA
-                best_x = x
-                best_y = y
-        return best_x, best_y, best_sample
+                best_sample = imageA.copy()
+                best_x, best_y = x, y
+    if best_sample is None:
+        raise ValueError("no overlapping context between scene and match")
+    return best_x, best_y, best_sample
 
 
-# In[40]:
+def find_scene(orig_scene: np.ndarray, match: np.ndarray):
+    """Find the best match for the masked scene within the match image.
 
-def create_seam_cut(orig_scene, mask_scene, 
-                    match_scene=None, orig_scene_no_mask=None):
-    """takes in the original scene and match scene
-    and gets optimal seam cut, via absolute difference
-    
-    and also the mask to compute the cost properly
-    
-    returns :
-    seam cut
+    Equivalent to a brute force masked SSD search over every window of
+    the match image, but computed with ``cv2.matchTemplate`` so that the
+    full search space is covered instantly instead of scanning only the
+    first row of positions.
+
+    returns:
+
+    best_x : row coordinate of best matching window
+    best_y : column coordinate of best matching window
+    match_scene : the best matching window
     """
-    
-    if match_scene == None:
-        match_scene = np.ones(orig_scene.shape) * 255
-        match_scene[orig_scene.shape[0], orig_scene.shape[1]] = 0
-    if orig_scene_no_mask == None:
-        orig_scene_no_mask = np.ones(orig_scene.shape) * 255
-        orig_scene_no_mask[orig_scene.shape[0], orig_scene.shape[1]] = 0
-    
-    
-    diff = np.absolute(np.subtract(match_scene, orig_scene))
-    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY).astype(np.float)
-    
-    for x in range(mask_scene.shape[0]):
-        for y in range(mask_scene.shape[1]):
-            if mask_scene[x,y] == 0:
-                diff_gray[x,y] = np.inf
-                
+    ir, ic, _ = orig_scene.shape
+    r, c, _ = match.shape
+    if ir > r or ic > c:
+        raise ValueError(
+            f"match image {match.shape[:2]} is smaller than the "
+            f"local context window {orig_scene.shape[:2]}")
+
+    mask = _context_mask(orig_scene)
+    if not mask.any():
+        raise ValueError("local context contains no valid (non black) pixels")
+
+    result = cv2.matchTemplate(match.astype(np.float32),
+                               orig_scene.astype(np.float32),
+                               cv2.TM_SQDIFF, mask=mask)
+    _, _, min_loc, _ = cv2.minMaxLoc(result)
+    # min_loc is (x=column, y=row); keep the original row/col convention
+    best_y, best_x = min_loc
+    best_sample = match[best_x:best_x + ir, best_y:best_y + ic].copy()
+    return best_x, best_y, best_sample
+
+
+def score_candidate(orig_scene: np.ndarray, match: np.ndarray) -> float:
+    """Masked context SSD of the best alignment (lower is better).
+
+    Used to rank multiple candidate photographs against each other.
+    """
+    ir, ic, _ = orig_scene.shape
+    if ir > match.shape[0] or ic > match.shape[1]:
+        return float("inf")
+    mask = _context_mask(orig_scene)
+    if not mask.any():
+        return float("inf")
+    result = cv2.matchTemplate(match.astype(np.float32),
+                               orig_scene.astype(np.float32),
+                               cv2.TM_SQDIFF, mask=mask)
+    return float(result.min())
+
+
+# ---------------------------------------------------------------------------
+# seam cutting
+# ---------------------------------------------------------------------------
+
+def _edge_points(lengths: Sequence[int], fixed: int, horizontal: bool,
+                 shape: Tuple[int, int]) -> List[Tuple[int, int]]:
+    """Build (row, col) points along an image edge segment.
+
+    ``horizontal=True`` runs along the top/bottom edge at row ``fixed``;
+    otherwise along the left/right edge at column ``fixed``.
+    """
+    points = []
+    for v in lengths:
+        v = int(v)
+        if v < 0:
+            continue
+        row, col = (fixed, v) if horizontal else (v, fixed)
+        if 0 <= row < shape[0] and 0 <= col < shape[1]:
+            points.append((row, col))
+    return points
+
+
+def create_seam_cut(orig_scene: np.ndarray, mask_scene: np.ndarray,
+                    match_scene: Optional[np.ndarray] = None,
+                    orig_scene_no_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """Cut around the hole using minimal difference seams (graph cut).
+
+    Four seams are traced with Dijkstra (skimage MCP) through the
+    per-pixel absolute difference map, joining the edge segments that
+    surround the hole. The enclosed area (hole + seams) is then
+    recovered with a flood fill.
+
+    returns:
+    mask_seam : 3 channel array, 255 where replacement happens
+    """
+    if match_scene is None:
+        match_scene = np.ones_like(orig_scene) * 255
+    if orig_scene_no_mask is None:
+        orig_scene_no_mask = np.ones_like(orig_scene) * 255
+
+    # cast to float BEFORE differencing: uint8 subtraction wraps around
+    diff = np.absolute(match_scene.astype(np.float64) - orig_scene.astype(np.float64))
+    diff_gray = cv2.cvtColor(diff.astype(np.float32), cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+    # seams may never pass through the hole itself
+    diff_gray[mask_scene == 0] = np.inf
+
     mask_info = np.where(mask_scene == 0)
+    h, w = diff_gray.shape
+    min_x, max_x = int(mask_info[0].min()), int(mask_info[0].max())
+    min_y, max_y = int(mask_info[1].min()), int(mask_info[1].max())
 
-    min_x, max_x, min_y, max_y = min(mask_info[0]), max(mask_info[0]), min(mask_info[1]), max(mask_info[1])
-    #print min_x, max_x, min_y, max_y
-    
-    # make 4 cuts, top left to top right, top left to bottom left, top right to bottom right and bottom left to bottom right.
     adj = 10
-    dim_diff = diff_gray.shape
 
+    NW_top = _edge_points(range(0, min_y - adj), 0, True, diff_gray.shape)
+    NW_left = _edge_points(range(0, min_x - adj), 0, False, diff_gray.shape)
 
-    NW_top = zip([0]*len(range(0, min_y-adj)), range(0, min_y-adj))
-    NW_left = zip(range(0, min_x-adj), [0]*len(range(0, min_x-adj))) 
-    top_left = NW_top + NW_left
+    NE_top = _edge_points(range(max_y + adj, w), 0, True, diff_gray.shape)
+    NE_right = _edge_points(range(0, min_x - adj), w - 1, False, diff_gray.shape)
 
-    NE_top = zip([0]*len(range(max_y+adj, dim_diff[1])), range(max_y+adj, dim_diff[1]))
-    NE_right = zip(range(0, min_x-adj), [dim_diff[1]-1]*len(range(0, min_x-adj)))
-    top_right =  NE_top + NE_right
+    SW_left = _edge_points(range(0, min_y - adj), h - 1, True, diff_gray.shape)
+    SW_bot = _edge_points(range(max_x + adj, h), 0, False, diff_gray.shape)
 
+    SE_right = _edge_points(range(max_y + adj, w), h - 1, True, diff_gray.shape)
+    SE_bot = _edge_points(range(max_x + adj, h), w - 1, False, diff_gray.shape)
+    bottom_right = SE_right + SE_bot
 
-    SW_left = zip([dim_diff[0]-1]*len(range(0, min_y-adj)), range(0, min_y-adj))
-    SW_bot = zip(range(max_x + adj, dim_diff[0]), [0]*len(range(max_x + adj, dim_diff[0])))
-    bottom_left =  SW_left + SW_bot
-
-    SE_right = zip([dim_diff[0]-1]*len(range(max_y+adj, dim_diff[1])), range(max_y+adj, dim_diff[1]))
-    SE_bot = zip(range(max_x + adj, dim_diff[0]), [dim_diff[1]-1]*len(range(max_x + adj, dim_diff[0])))
-    bottom_right =  SE_right + SE_bot
-    
-    diff_path = np.zeros(diff_gray.shape)
-    
-    try:    
+    def trace(starts, ends, out):
+        """Trace up to 10 random minimum cost seams and paint them."""
+        starts, ends = list(starts), list(ends)
+        if not starts or not ends:
+            return False
         costMCP = skimage.graph.MCP(diff_gray, fully_connected=True)
-        cumpath, trcb = costMCP.find_costs(starts=NW_left, ends=NE_right)
-        
+        costMCP.find_costs(starts=starts, ends=ends)
+        painted = False
         for _ in range(10):
-            path_tltr = costMCP.traceback(choice(NE_right)) # select a random end point
-            for x,y in path_tltr:
-                diff_path[x, y] = 255 
-    except:
-        pass
-    
-    try:
-        costMCP = skimage.graph.MCP(diff_gray, fully_connected=True)
-        cumpath, trcb = costMCP.find_costs(starts=NW_top, ends=SW_bot)
-        
-        # get 10 random paths...
-        for _ in range(10):
-            path_tlbl = costMCP.traceback(choice(SW_bot))
-            for x,y in path_tlbl:
-                diff_path[x, y] = 255            
-    except:
-        pass
+            end = random.choice(ends)
+            try:
+                path = costMCP.traceback(end)
+            except Exception:
+                continue
+            if not path:
+                continue
+            for x, y in path:
+                out[x, y] = 255
+            painted = True
+        return painted
 
-    try:
-        costMCP = skimage.graph.MCP(diff_gray, fully_connected=True)
-        cumpath, trcb = costMCP.find_costs(starts=NE_top, ends=SE_bot)
-        
-        # get 10 random paths...
-        for _ in range(10):
-            path_trbr = costMCP.traceback(choice(SE_bot))
-            for x,y in path_trbr:
-                diff_path[x, y] = 255
-    except:
-        pass
-    
-    try:
-        costMCP = skimage.graph.MCP(diff_gray, fully_connected=True)
-        cumpath, trcb = costMCP.find_costs(starts=SW_left, ends=SE_right)
-        
-        
-        # get 10 random paths...
-        for _ in range(10):
-            path_blbr = costMCP.traceback(choice(bottom_right))
-            for x,y in path_blbr:
-                diff_path[x, y] = 255
-    except:
-        pass
-        
-    #use flood fill to add in the mask area.
-    
-    h,w = diff_path.shape
-    mask = np.zeros((h+2,w+2),np.uint8) 
-    diff = (1,1)
-    # make sure you recast the type
-    #plt.imshow(diff_path)
-    
-    # select random point in the mask
-    orig_mask = np.where(orig_scene_no_mask == 0)
-    
-    #print diff_path.shape, (orig_mask[0][rnd_point], orig_mask[1][rnd_point])
-    #print mask.shape
-    for _ in range(10):
-        try:
-            rnd_point = choice(range(len(orig_mask[0])))    
-            diff_fill = cv2.floodFill(diff_path.astype(np.uint8),mask,
-                                 (orig_mask[0][rnd_point], orig_mask[1][rnd_point]), (255, 255),diff,diff)[1] 
-            break
-        except:
-            pass
-    # to make floodfill work
-    # erode and dialate the result...
-    kernel = np.ones((5,5),np.uint8)
-    diff_fill = cv2.erode(diff_fill, kernel, iterations = 2)
-    diff_fill = cv2.dilate(diff_fill, kernel, iterations = 2)
-        
-    # blur and threshold...
-    diff_fill = cv2.blur(diff_fill, (10,10))
-    diff_fill = cv2.threshold(diff_fill, 5, 255, cv2.THRESH_BINARY)[1]
+    diff_path = np.zeros(diff_gray.shape, np.uint8)
+    # four cuts around the hole: across the top / down the left /
+    # down the right / across the bottom
+    trace(NW_left, NE_right, diff_path)
+    trace(NW_top, SW_bot, diff_path)
+    trace(NE_top, SE_bot, diff_path)
+    trace(SW_left, bottom_right, diff_path)
+
+    # flood fill from a point inside the hole to close the seam loop.
+    hole_rows, hole_cols = np.where((orig_scene_no_mask[:, :, 0] == 0) &
+                                    (diff_path == 0))
+    if len(hole_rows) == 0:
+        hole_rows, hole_cols = np.where(orig_scene_no_mask[:, :, 0] == 0)
+    if len(hole_rows) == 0:
+        raise ValueError("cannot find a seed point inside the hole for flood fill")
+
+    diff_fill = diff_path.copy()
+    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+    rnd = random.randrange(len(hole_rows))
+    seed = (int(hole_cols[rnd]), int(hole_rows[rnd]))
+    cv2.floodFill(diff_fill, ff_mask, seed, 255, loDiff=0, upDiff=0)
+
+    # erode and dilate the result to clean up speckles
+    kernel = np.ones((5, 5), np.uint8)
+    diff_fill = cv2.erode(diff_fill, kernel, iterations=2)
+    diff_fill = cv2.dilate(diff_fill, kernel, iterations=2)
+
+    # blur and threshold to slightly feather the seam
+    diff_fill = cv2.blur(diff_fill, (10, 10))
+    _, diff_fill = cv2.threshold(diff_fill, 5, 255, cv2.THRESH_BINARY)
     return np2to3(diff_fill)
 
 
+# ---------------------------------------------------------------------------
+# compositing
+# ---------------------------------------------------------------------------
 
-# In[41]:
+def composite_scene(orig_scene: np.ndarray, mask_seam: np.ndarray,
+                    match_scene: np.ndarray, dialation_mask: np.ndarray,
+                    orig_scene1: np.ndarray, method: str = "paste",
+                    repeat: int = 1) -> np.ndarray:
+    """Combine the original and matched scenes based on the seam mask.
 
-def composite_scene(orig_scene, mask_seam, match_scene, dialation_mask, orig_scene1, method="paste", repeat=1):
-    """
-    combines images based on mask, has a few methods
-    
-    method='paste', is a straight copy
-    'seamlessclone', uses cv2.seamlessclone
+    method='paste'          straight copy inside the seam region
+    method='alphablend'     feathered blend along the seam
+    method='seamlessclone'  Poisson blending (cv2.seamlessClone) with an
+                            alpha blended refinement pass
     """
     avg_pixel = np.mean(orig_scene1[orig_scene1 != 0])
-    
-    output = np.zeros(orig_scene.shape)
-    if method=="seamlessclone":
-        width, height, _ = match_scene.shape
-        center = (height/2, width/2)
-        
+
+    output = np.zeros(orig_scene.shape, np.float64)
+
+    if method == "seamlessclone":
+        hh, ww = match_scene.shape[:2]
+        center = (ww // 2, hh // 2)  # must be integers for seamlessClone
+
         # create plain white mask
-        mask = np.zeros(match_scene.shape, match_scene.dtype) + 255
-        
+        mask = np.full(match_scene.shape, 255, match_scene.dtype)
+
         orig_scene_impute = orig_scene.copy()
         orig_scene_impute[mask_seam == 255] = avg_pixel
-        
-        
-        
-        #image_to_compare
-        output_blend = cv2.seamlessClone(match_scene.astype(np.uint8), 
-                                         orig_scene_impute.astype(np.uint8), 
-                                         mask, center,cv2.NORMAL_CLONE)
-        
-        #implot(output_blend)
-        # now reapply the mask with alpha blending to fix it up again.
-        
-        """
-        TO DO CHANGE IT FROM THE DILATION + MASK SEAM, NEED TO FIND THE INTERSECTION OF THESE TWO TO BE THE 
-        REAL MASK TO BLUR
-        """
-        dilation_mask = mask_seam.copy()
-        
-        dilation_mask = cv2.GaussianBlur(dilation_mask, (101,101), 0) # blur mask and do a alpha blend... between the 
-        #implot(dilation_mask, 'gray')
-        
-        dilation_mask = dilation_mask/255.0
-        
-        
-        
-        # 0 is black, 1 is white
-        #output = cv2.addWeighted(output_blend, dialation_mask, orig_scene, 1-dialation_mask)
-        #print dialation_mask
-        #print dialation_mask.shape
-        #print output_blend.shape
-        #a = cv2.multiply(output_blend.astype(np.float), dialation_mask)
-        
-        for _ in range(10):
-            # some kind of layered alpha blend by the dilation mask values...
-            orig_scene_impute = orig_scene.copy()
+
+        output_blend = cv2.seamlessClone(match_scene.astype(np.uint8),
+                                         orig_scene_impute.astype(np.uint8),
+                                         mask, center, cv2.NORMAL_CLONE).astype(np.float64)
+
+        # blur the seam mask and use it as alpha for feathering
+        dilation_mask = mask_seam.astype(np.float64)
+        dilation_mask = cv2.GaussianBlur(dilation_mask, (101, 101), 0)
+        dilation_mask = dilation_mask / 255.0
+
+        for _ in range(repeat + 10):
+            # layered alpha blend between the clone and the original
+            orig_scene_impute = orig_scene.astype(np.float64)
             orig_scene_impute[mask_seam == 255] = output_blend[mask_seam == 255]
-            output_blend = cv2.add(cv2.multiply(output_blend.astype(np.float), dilation_mask),
-                             cv2.multiply(orig_scene_impute.astype(np.float), 1-dilation_mask), 0)
-        
-        
+            output_blend = cv2.add(cv2.multiply(output_blend, dilation_mask),
+                                   cv2.multiply(orig_scene_impute, 1 - dilation_mask))
+
         orig_scene_impute = orig_scene.copy()
         orig_scene_impute[mask_seam == 255] = output_blend[mask_seam == 255]
-        output_blend = cv2.add(cv2.multiply(output_blend.astype(np.float), dilation_mask),
-                         cv2.multiply(orig_scene_impute.astype(np.float), 1-dilation_mask), 0)
-        
-        
-        
-        orig_scene_impute = orig_scene.copy()
-        orig_scene_impute[mask_seam == 255] = output_blend[mask_seam == 255]
-        output = cv2.seamlessClone(match_scene.astype(np.uint8), 
-                                   output_blend.astype(np.uint8), 
-                                   mask, center,cv2.NORMAL_CLONE)
-        
-        # complete blend with seamlessclone...
-        
-        
-        # output = np.maximum(output_blend, orig_scene_impute)
-        # or just darken...
-        
-        
-        #if repeat == 1:
-        #    return output_blend
-        #output = composite_scene(orig_scene_impute, mask_seam, output_blend, dialation_mask, method="paste")
-        
+        output = cv2.seamlessClone(match_scene.astype(np.uint8),
+                                   np.clip(output_blend, 0, 255).astype(np.uint8),
+                                   mask, center, cv2.NORMAL_CLONE)
+        output = output.astype(np.float64)
 
-
-    elif method=="paste":
+    elif method == "paste":
         output[mask_seam == 0] = orig_scene[mask_seam == 0]
         output[mask_seam != 0] = match_scene[mask_seam != 0]
-        
-    elif method=="alphablend":
-        output_blend = output.copy()
-        output_blend[mask_seam == 0] = orig_scene[mask_seam == 0]
-        output_blend[mask_seam != 0] = match_scene[mask_seam != 0]
-        
-        
-    
-        
+
+    elif method == "alphablend":
+        # feathered blend using the seam mask as alpha
+        alpha = mask_seam.astype(np.float64)
+        alpha = cv2.GaussianBlur(alpha, (31, 31), 0) / 255.0
+        output = (orig_scene.astype(np.float64) * (1 - alpha) +
+                  match_scene.astype(np.float64) * alpha)
+
     else:
         output[mask_seam == 0] = orig_scene[mask_seam == 0]
         output[mask_seam != 0] = match_scene[mask_seam != 0]
-    return output
-        
-    
+
+    return np.clip(output, 0, 255)
 
 
-# In[42]:
+def composite(orig: np.ndarray, com_scene: np.ndarray, mask: np.ndarray,
+              local_context_size: int = 80) -> np.ndarray:
+    """Paste the completed local context back into the full size image."""
+    mask_info = np.where(mask == 0)
+    min_x = max(int(mask_info[0].min()) - local_context_size, 0)
+    max_x = int(mask_info[0].max()) + local_context_size
+    min_y = max(int(mask_info[1].min()) - local_context_size, 0)
+    max_y = int(mask_info[1].max()) + local_context_size
 
-def composite(orig, com_scene, mask, local_context_size = 80):
-    mask_info = np.where(mask == 0)    
-    min_x = max(min(mask_info[0]) - local_context_size, 0)
-    max_x = max(mask_info[0]) + local_context_size
-    min_y = max(min(mask_info[1]) - local_context_size, 0)
-    max_y = max(mask_info[1]) + local_context_size    
-    
-    orig_new = orig.copy()
-    orig_new[min_x:max_x,min_y:max_y] = com_scene
-    return orig_new
+    orig_new = orig.copy().astype(np.float64)
+    orig_new[min_x:max_x, min_y:max_y] = com_scene
+    return np.clip(orig_new, 0, 255).astype(np.uint8)
 
 
-# In[43]:
+# ---------------------------------------------------------------------------
+# high level pipeline
+# ---------------------------------------------------------------------------
 
-def local_context_match(orig_name, mask_name, match_name, local_context_size=55, method='seamlessclone', dilation=True):
-    """
-    Sample usage:
-    
-    #output = local_context_match("source.jpg", "source_mask.jpg", "match.jpg", 60)
-    #implot(output)    
-    
-    should be wrapped as a class or a dict, right now this is poor design.
-    """
+def scene_completion_pipeline(orig_name: str, mask_name: str, match_name: str,
+                              local_context_size: int = 55,
+                              dilation: bool = True) -> Dict[str, object]:
+    """Run the full pipeline and return every intermediate stage."""
     orig, mask, match = read_images(orig_name, mask_name, match_name)
-    orig_scene, mask_scene, orig_scene_no_mask, dialation_mask = get_masked_scene(orig, mask, local_context_size, dilation=dilation)
+    orig_scene, mask_scene, orig_scene_no_mask, dialation_mask = get_masked_scene(
+        orig, mask, local_context_size, dilation=dilation)
     best_x, best_y, match_scene = find_scene(orig_scene, match)
     mask_seam = create_seam_cut(orig_scene, mask_scene, match_scene, orig_scene_no_mask)
-    
-    # changing method arg won't change this.
-    com_scene = composite_scene(orig_scene_no_mask, mask_seam, match_scene, dialation_mask, orig_scene, method="seamlessclone") 
-    return composite(orig, com_scene, mask, local_context_size)
-    
-    
 
-
-# In[44]:
-
-def local_context_match_im_output(orig_name, mask_name, match_name, local_context_size=55, 
-                                  method='seamlessclone', dilation=True, save=False):
-    """
-    Sample usage:
-    
-    #output = local_context_match("source.jpg", "source_mask.jpg", "match.jpg", 60)
-    #implot(output)    
-    
-    should be wrapped as a class or a dict, right now this is poor design.
-    """
-    orig, mask, match = read_images(orig_name, mask_name, match_name)
-    orig_scene, mask_scene, orig_scene_no_mask, dialation_mask = get_masked_scene(orig, mask, local_context_size, dilation=dilation)
-    best_x, best_y, match_scene = find_scene(orig_scene, match)
-    mask_seam = create_seam_cut(orig_scene, mask_scene, match_scene, orig_scene_no_mask)
-    
-    # changing method arg won't change this.
-    com_scene = composite_scene(orig_scene_no_mask, mask_seam, match_scene, dialation_mask, orig_scene, method="seamlessclone") 
-    paste_com = composite_scene(orig_scene_no_mask, mask_seam, match_scene, dialation_mask, orig_scene, method="paste")
-    paste_com1 = composite_scene(orig_scene_no_mask, 255-np2to3(mask_scene), match_scene, dialation_mask, orig_scene, method="paste")
-    paste_com2 = composite_scene(orig_scene_no_mask, 255-np2to3(mask_scene), match_scene, dialation_mask, orig_scene, method="seamlessclone")
-    paste_com3 = composite_scene(orig_scene_no_mask, mask_seam, paste_com2, dialation_mask, orig_scene, method="paste")
-    paste_com3 = paste_com3.astype(np.uint8)
-    paste_com4 = composite_scene(orig_scene_no_mask, 255-np2to3(mask_scene), paste_com3, dialation_mask, orig_scene, method="seamlessclone")
+    com_scene = composite_scene(orig_scene_no_mask, mask_seam, match_scene,
+                                dialation_mask, orig_scene, method="seamlessclone")
+    paste_com = composite_scene(orig_scene_no_mask, mask_seam, match_scene,
+                                dialation_mask, orig_scene, method="paste")
+    paste_com1 = composite_scene(orig_scene_no_mask, 255 - np2to3(mask_scene), match_scene,
+                                 dialation_mask, orig_scene, method="paste")
+    paste_com2 = composite_scene(orig_scene_no_mask, 255 - np2to3(mask_scene), match_scene,
+                                 dialation_mask, orig_scene, method="seamlessclone")
+    paste_com3 = composite_scene(orig_scene_no_mask, mask_seam, paste_com2,
+                                 dialation_mask, orig_scene, method="paste")
+    paste_com4 = composite_scene(orig_scene_no_mask, 255 - np2to3(mask_scene),
+                                 paste_com3.astype(np.uint8),
+                                 dialation_mask, orig_scene, method="seamlessclone")
     output = composite(orig, paste_com3, mask, local_context_size)
-    
-    if save:
-    #output lots of stuff
-        cv2.imwrite("sample/%s.jpg" % ("orig_scene"), orig_scene)
-        cv2.imwrite("sample/%s.jpg" % ("mask_scene"), mask_scene)
-        cv2.imwrite("sample/%s.jpg" % ("orig_scene_no_mask"), orig_scene_no_mask)
-        cv2.imwrite("sample/%s.jpg" % ("dialation_mask"), dialation_mask)
-        cv2.imwrite("sample/%s.jpg" % ("match_scene"), match_scene)
-        cv2.imwrite("sample/%s.jpg" % ("mask_seam"), mask_seam)
-        cv2.imwrite("sample/%s.jpg" % ("com_scene"), com_scene)
-        cv2.imwrite("sample/%s.jpg" % ("paste_com"), paste_com)
-        cv2.imwrite("sample/%s.jpg" % ("paste_com1"), paste_com1)
-        cv2.imwrite("sample/%s.jpg" % ("paste_com2"), paste_com2)
-        cv2.imwrite("sample/%s.jpg" % ("paste_com3"), paste_com3)
-        cv2.imwrite("sample/%s.jpg" % ("paste_com4"), paste_com4)
+
+    return {
+        "orig": orig, "mask": mask, "match": match,
+        "orig_scene": orig_scene, "mask_scene": mask_scene,
+        "orig_scene_no_mask": orig_scene_no_mask,
+        "dialation_mask": dialation_mask,
+        "best_x": best_x, "best_y": best_y,
+        "match_scene": match_scene, "mask_seam": mask_seam,
+        "com_scene": com_scene, "paste_com": paste_com,
+        "paste_com1": paste_com1, "paste_com2": paste_com2,
+        "paste_com3": paste_com3, "paste_com4": paste_com4,
+        "output": output,
+    }
 
 
-        cv2.imwrite("sample/%s.jpg" % ("output"), output)
-    
-    #return composite_scene(orig_scene_no_mask, 255-np2to3(mask_scene), match_scene, dialation_mask, orig_scene, method="seamlessclone")
-    return output
-    
+def local_context_match(orig_name: str, mask_name: str, match_name: str,
+                        local_context_size: int = 55,
+                        method: str = 'seamlessclone',
+                        dilation: bool = True) -> np.ndarray:
+    """Complete the ``mask_name`` region of ``orig_name`` using ``match_name``.
 
-    
-output = local_context_match_im_output("source.jpg", "mask.jpg", "match.jpg",
-                            local_context_size=45, save=True)
-#output = local_context_match_im_output("images/input2.jpg", "images/input2_mask.jpg", "images/input2/result_img002.jpg",
-#                             local_context_size=55, save=True)
-implot(output)
+    Sample usage::
 
-
-# In[45]:
-
-# breakdown by part for another one.
-#output = local_context_match_im_output("images/input2.jpg", "images/input2_mask.jpg", "images/input2/result_img002.jpg",
-#                             local_context_size=55, save=True)
-
-orig_name, mask_name, match_name = "source.jpg", "mask.jpg", "match.jpg"
-local_context_size = 55
-dilation = True
-
-orig, mask, match = read_images(orig_name, mask_name, match_name)
+        output = local_context_match("source.jpg", "source_mask.jpg", "match.jpg", 60)
+    """
+    stages = scene_completion_pipeline(orig_name, mask_name, match_name,
+                                       local_context_size, dilation)
+    return stages["output"]  # noqa: kept simple; method arg retained for API compat
 
 
-# In[46]:
-
-implot(orig)
-
-
-# In[47]:
-
-implot(255-np2to3(mask))
-
-
-# In[48]:
-
-implot(match)
-
-
-# In[49]:
-
-orig_scene, mask_scene, orig_scene_no_mask, dialation_mask = get_masked_scene(orig, mask, local_context_size, dilation=dilation)
-implot(orig_scene)
-
-
-# In[50]:
-
-implot(255-np2to3(mask_scene))
+def pick_best_candidate(orig_name: str, mask_name: str,
+                        candidates: Sequence[str],
+                        local_context_size: int = 55) -> Tuple[str, float]:
+    """Rank candidate images by masked context SSD and return the best."""
+    orig, mask, _ = read_images(orig_name, mask_name, candidates[0])
+    orig_scene, _, _, _ = get_masked_scene(orig, mask, local_context_size)
+    best_name, best_score = None, float("inf")
+    for name in candidates:
+        cand = cv2.imread(name)
+        if cand is None:
+            continue
+        score = score_candidate(orig_scene, cand)
+        print(f"  candidate {os.path.basename(name)}: ssd={score:.4e}")
+        if score < best_score:
+            best_name, best_score = name, score
+    if best_name is None:
+        raise ValueError("no readable candidate images found")
+    return best_name, best_score
 
 
-# In[51]:
-
-implot(orig_scene_no_mask)
-
-
-# In[52]:
-
-implot(255-np2to3(dialation_mask))
-
-
-# In[53]:
-
-best_x, best_y, match_scene = find_scene(orig_scene, match)
+def save_stages(stages: Dict[str, object], save_dir: str) -> None:
+    """Write every pipeline stage to ``save_dir`` as jpg files."""
+    os.makedirs(save_dir, exist_ok=True)
+    for name, im in stages.items():
+        if isinstance(im, np.ndarray):
+            cv2.imwrite(os.path.join(save_dir, f"{name}.jpg"),
+                        np.clip(im, 0, 255).astype(np.uint8))
 
 
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Scene completion via local context matching.")
+    parser.add_argument("--image", required=True, help="original photograph")
+    parser.add_argument("--mask", required=True,
+                        help="mask image, black = region to fill")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--match", help="candidate image to source pixels from")
+    group.add_argument("--candidates-dir",
+                       help="directory of candidates; the best scoring one is used")
+    parser.add_argument("--context-size", type=int, default=55,
+                        help="local context margin in pixels (default 55)")
+    parser.add_argument("--save-dir", default="output",
+                        help="where to write the result and diagnostics")
+    parser.add_argument("--quiet", action="store_true",
+                        help="do not print per-candidate scores")
+    args = parser.parse_args(argv)
 
-# In[54]:
+    random.seed(0)
 
-implot(match_scene)
+    if args.candidates_dir:
+        candidates = sorted(glob.glob(os.path.join(args.candidates_dir, "*.jpg")))
+        if not candidates:
+            parser.error(f"no .jpg candidates in {args.candidates_dir}")
+        if args.quiet:
+            import contextlib
+            with contextlib.redirect_stdout(None):
+                best, score = pick_best_candidate(args.image, args.mask, candidates,
+                                                  args.context_size)
+        else:
+            best, score = pick_best_candidate(args.image, args.mask, candidates,
+                                              args.context_size)
+        print(f"selected candidate: {os.path.basename(best)} "
+              f"(context SSD {score:.3e})")
+        match_name = best
+    else:
+        match_name = args.match
+
+    stages = scene_completion_pipeline(args.image, args.mask, match_name,
+                                       args.context_size)
+    save_stages(stages, args.save_dir)
+    print(f"wrote {os.path.join(args.save_dir, 'output.jpg')}")
+    return 0
 
 
-# In[55]:
-
-mask_seam = create_seam_cut(orig_scene, mask_scene, match_scene, orig_scene_no_mask)
-
-
-# In[56]:
-
-implot(mask_seam)
-
-
-# In[57]:
-
-com_scene = composite_scene(orig_scene_no_mask, mask_seam, match_scene, dialation_mask, orig_scene, method="seamlessclone") 
-paste_com = composite_scene(orig_scene_no_mask, mask_seam, match_scene, dialation_mask, orig_scene, method="paste")
-paste_com1 = composite_scene(orig_scene_no_mask, 255-np2to3(mask_scene), match_scene, dialation_mask, orig_scene, method="paste")
-paste_com2 = composite_scene(orig_scene_no_mask, 255-np2to3(mask_scene), match_scene, dialation_mask, orig_scene, method="seamlessclone")
-paste_com3 = composite_scene(orig_scene_no_mask, mask_seam, paste_com2, dialation_mask, orig_scene, method="paste")
-paste_com3 = paste_com3.astype(np.uint8)
-paste_com4 = composite_scene(orig_scene_no_mask, 255-np2to3(mask_scene), paste_com3, dialation_mask, orig_scene, method="seamlessclone")
-implot(paste_com4)
-
-
-# In[58]:
-
-output = composite(orig, paste_com3, mask, local_context_size)
-implot(output)
-
+if __name__ == "__main__":
+    raise SystemExit(main())
