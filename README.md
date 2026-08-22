@@ -76,10 +76,8 @@ uv run python local_context_matching.py \
 Every intermediate stage (context windows, best match, seam mask, composites,
 final output) is written to `--save-dir`. The last stage written,
 `output_lama.jpg`, is the final output after the LaMa seam cleanup pass.
-Pass `--no-lama` to skip it entirely, `--lama-ring` to only repaint a ring
-around each paste boundary instead of the whole filled region, `--lama-band N`
-to change the minimum margin (default 12), or `--lama-band-scale F` to change
-how the margin grows with hole size (default 0.25, capped at 64 px).
+Pass `--no-lama` to skip it entirely, or `--lama-band N` to change the width
+of the seam ring repainted by LaMa (default 12 px).
 
 ### LaMa seam inpainting
 
@@ -88,14 +86,19 @@ content is pasted over the original photo. [`lama_inpaint.py`](lama_inpaint.py)
 removes these artefacts with [LaMa](https://github.com/advimman/lama) running
 through OpenCV's DNN module:
 
-1. a **solid region mask** is built from the seam cut — the entire replaced
-   area (hole + seams), grown outward by an adaptive margin of
-   `max(12 px, min(64 px, 0.25 × hole side))`, so LaMa re-synthesises the
-   whole fill rather than just harmonising its edges,
-2. a padded window around that region is resampled to the network's fixed
-   512x512 input, inpainted in one pass, and resampled back at full resolution
-   — much sharper than squashing the whole photograph to 512x512,
-3. the result is feather-blended strictly inside the region mask, so pixels
+1. a thin **seam ring** is derived from the seam cut — `band` pixels
+   straddling every paste boundary (the hole rim plus each graph-cut
+   seam), so LaMa re-synthesises only the visible transition and leaves
+   the matched fill itself untouched,
+2. segments running along the image borders are dropped — pasted content
+   that runs off the edge has no transition to hide there — and a
+   degenerated seam cut (flood fill swallowed the whole context) falls
+   back to the hole outline alone,
+3. a padded window around the ring is resampled to the network's fixed
+   512x512 input, inpainted in one pass, and resampled back at full
+   resolution — much sharper than squashing the whole photograph to
+   512x512,
+4. the result is feather-blended strictly inside the ring, so pixels
    outside it remain bit-identical to the raw composite.
 
 The weights live in [`models/lama.onnx`](models/lama.onnx) and are tracked with
@@ -132,9 +135,10 @@ uv run jupyter lab
 | `create_seam_cut` | four minimum-cost seams around the hole via `skimage.graph.MCP`, closed by flood fill |
 | `composite_scene` | merge match into original via `paste`, feathered `alphablend`, or Poisson `seamlessclone` |
 | `composite` | paste the completed context back into the full size image |
-| `build_seam_band_mask` | ring or solid LaMa region derived from the pasted (match) area |
-| `_adaptive_band_width` | region margin from hole size, clamped between min and cap |
-| `inpaint_seams_lama` | re-synthesise the fill with LaMa and feather-blend it back |
+| `build_seam_band_mask` | thin ring straddling the boundary of the pasted (match) region |
+| `_replaced_region` | replaced-area map; degenerated seam cuts fall back to the hole |
+| `_strip_image_edges` | drops mask pixels along the image borders |
+| `inpaint_seams_lama` | re-synthesise the paste seams with LaMa and feather-blend them back |
 | `local_context_match` / `scene_completion_pipeline` | run everything end to end |
 
 `lama_inpaint.py` wraps the ONNX model itself: lazy single load of the network,

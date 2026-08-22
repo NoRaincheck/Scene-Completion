@@ -142,36 +142,43 @@ def test_build_seam_band_mask_is_a_boundary_ring():
     assert (g > 0).sum() < 0.25 * g.size
 
 
-def test_build_seam_band_mask_solid_fills_region():
-    """Solid mode must cover the whole replaced region plus its margin."""
-    replaced = np.zeros((100, 100), np.uint8)
-    replaced[30:70, 35:65] = 255
+def test_replaced_region_scales_back_degenerate_seam():
+    """A seam cut that swallowed the whole crop falls back to the hole."""
+    hole = np.full((100, 100), 255, np.uint8)
+    hole[30:70, 35:65] = 0
 
-    solid = lcm.build_seam_band_mask(replaced, band=6, solid=True)
+    # healthy seam cut: union of seam and hole
+    seam = np.zeros((100, 100), np.uint8)
+    seam[30:70, 35:65] = 255
+    seam[10:20, 50] = 255                       # a seam path in the context
+    replaced = lcm._replaced_region(seam, hole)
+    assert replaced[15, 50]                     # seam path included
+    assert replaced[50, 50] and not replaced[29, 50]
 
-    assert solid.shape == (100, 100)
-    assert (solid[30:70, 35:65] == 255).all()   # interior fully covered
-    assert solid[29, 50] == 255                 # margin grown outside
-    assert solid[71, 50] == 255
-    assert solid[22, 50] == 0                   # beyond ~band: untouched
-    assert solid[2, 2] == 0
+    # degenerate seam cut: nearly every pixel marked -- carries no
+    # boundary information, so only the hole is used
+    solid_seam = np.full((100, 100), 255, np.uint8)
+    replaced = lcm._replaced_region(solid_seam, hole)
+    assert replaced[50, 50]                     # hole still replaced
+    assert not replaced[10, 10]                 # context no longer included
 
 
-def test_adaptive_band_width_grows_with_hole_size():
-    small = np.full((200, 200), 255, np.uint8)
-    small[90:110, 90:110] = 0                       # 20 px hole
-    assert lcm._adaptive_band_width(small, min_band=12,
-                                    scale=0.25) == 12   # clamped to minimum
+def test_strip_image_edges_clears_border_frame():
+    """Ring segments along the image borders must never be repainted."""
+    mask = np.zeros((60, 80), np.uint8)
+    mask[5:55, 5:75] = 255
+    mask[0:2, :] = 255                          # touches all four borders
+    mask[-2:, :] = 255
+    mask[:, 0:2] = 255
+    mask[:, -2:] = 255
 
-    big = np.full((400, 400), 255, np.uint8)
-    big[100:300, 150:250] = 0                       # 200 px hole
-    assert lcm._adaptive_band_width(big, min_band=12,
-                                    scale=0.25) == 50   # 0.25 * 200
+    stripped = lcm._strip_image_edges(mask, margin=4)
 
-    huge = np.full((1000, 1000), 255, np.uint8)
-    huge[100:900, 100:900] = 0                      # 800 px hole
-    assert lcm._adaptive_band_width(huge, min_band=12,
-                                    scale=0.25) == 64   # clamped to maximum
+    assert (stripped[:4, :] == 0).all()
+    assert (stripped[-4:, :] == 0).all()
+    assert (stripped[:, :4] == 0).all()
+    assert (stripped[:, -4:] == 0).all()
+    assert stripped[30, 40] == 255              # interior untouched
 
 
 # ---------------------------------------------------------------------------
